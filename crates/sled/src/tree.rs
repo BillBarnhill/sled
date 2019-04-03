@@ -174,7 +174,7 @@ impl Tree {
         // correctness of the ret value
         let tx = self.context.pagecache.begin()?;
 
-        let path = self.path_for_key(key.as_ref(), &tx)?;
+        let path = self.leaf_data_for_key(key.as_ref(), &tx)?;
         let (_last_id, last_frag, _tree_ptr) = path
             .last()
             .expect("path should always contain a last element");
@@ -237,7 +237,7 @@ impl Tree {
 
         let tx = self.context.pagecache.begin()?;
 
-        let path = self.path_for_key(key.as_ref(), &tx)?;
+        let path = self.leaf_data_for_key(key.as_ref(), &tx)?;
         let (_last_id, last_frag, _tree_ptr) = path
             .last()
             .expect("path should always contain a last element");
@@ -386,7 +386,7 @@ impl Tree {
             let (mut path, existing_val) =
                 self.get_internal(key.as_ref(), &tx)?;
             let (leaf_id, leaf_frag, leaf_ptr) = path.pop().expect(
-                "path_for_key should always return a path \
+                "leaf_data_for_key should always return a path \
                  of length >= 2 (root + leaf)",
             );
             let node: &Node = leaf_frag.unwrap_base();
@@ -460,7 +460,7 @@ impl Tree {
             let mut subscriber_reservation = self.subscriptions.reserve(&key);
 
             let (leaf_id, leaf_frag, leaf_ptr) = path.pop().expect(
-                "path_for_key should always return a path \
+                "leaf_data_for_key should always return a path \
                  of length >= 2 (root + leaf)",
             );
             let node: &Node = leaf_frag.unwrap_base();
@@ -555,9 +555,9 @@ impl Tree {
         loop {
             let tx = self.context.pagecache.begin()?;
 
-            let mut path = self.path_for_key(key.as_ref(), &tx)?;
+            let mut path = self.leaf_data_for_key(key.as_ref(), &tx)?;
             let (leaf_id, leaf_frag, leaf_ptr) = path.pop().expect(
-                "path_for_key should always return a path \
+                "leaf_data_for_key should always return a path \
                  of length >= 2 (root + leaf)",
             );
             let node: &Node = leaf_frag.unwrap_base();
@@ -1006,7 +1006,7 @@ impl Tree {
         key: K,
         tx: &'g Tx,
     ) -> Result<(Path<'g>, Option<&'g IVec>)> {
-        let path = self.path_for_key(key.as_ref(), tx)?;
+        let path = self.leaf_data_for_key(key.as_ref(), tx)?;
 
         let ret = path.last().and_then(|(_last_id, last_frag, _tree_ptr)| {
             let last_node = last_frag.unwrap_base();
@@ -1028,8 +1028,8 @@ impl Tree {
     pub fn key_debug_str<K: AsRef<[u8]>>(&self, key: K) -> String {
         let tx = self.context.pagecache.begin().unwrap();
 
-        let path = self.path_for_key(key.as_ref(), &tx).expect(
-            "path_for_key should always return at least 2 nodes, \
+        let path = self.leaf_data_for_key(key.as_ref(), &tx).expect(
+            "leaf_data_for_key should always return at least 2 nodes, \
              even if the key being searched for is not present",
         );
         let mut ret = String::new();
@@ -1044,15 +1044,14 @@ impl Tree {
 
     /// returns the traversal path, completing any observed
     /// partially complete splits or merges along the way.
-    pub(crate) fn path_for_key<'g, K: AsRef<[u8]>>(
+    pub(crate) fn leaf_data_for_key<'g, K: AsRef<[u8]>>(
         &self,
         key: K,
         tx: &'g Tx,
-    ) -> Result<Path<'g>> {
+    ) -> Result<Data> {
         let _measure = Measure::new(&M.tree_traverse);
 
         let mut cursor = self.root.load(SeqCst);
-        let mut path: Vec<(PageId, &'g Frag, TreePtr<'g>)> = vec![];
 
         // unsplit_parent is used for tracking need
         // to complete partial splits.
@@ -1064,41 +1063,32 @@ impl Tree {
                 // this collection has been explicitly removed
                 return Err(Error::CollectionNotFound(self.tree_id.clone()));
             }
-            let get_cursor = self.context.pagecache.get(cursor, tx)?;
+            let (cas_key, frags) =
+                self.context.pagecache.get_page_frags(cursor, tx)?;
 
-            if get_cursor.is_free() {
+            let mut view = view::View::new(&frags);
+
+            if view.is_free() {
                 // restart search from the tree's root
                 not_found_loops += 1;
                 debug_assert_ne!(
                     not_found_loops, 10_000,
-                    "cannot find pid {} in path_for_key",
+                    "cannot find pid {} in leaf_data_for_key",
                     cursor
                 );
                 cursor = self.root.load(SeqCst);
                 continue;
             }
 
-            let (frag, cas_key) = match get_cursor {
-                PageGet::Materialized(node, cas_key) => (node, cas_key),
-                broken => {
-                    return Err(Error::ReportableBug(format!(
-                        "got non-base node while traversing tree: {:?}",
-                        broken
-                    )));
-                }
-            };
-
-            let node = frag.unwrap_base();
-
             // TODO this may need to change when handling (half) merges
-            assert!(node.lo.as_ref() <= key.as_ref(), "overshot key somehow");
+            assert!(view.lo() <= key.as_ref(), "overshot key somehow");
 
             // half-complete split detect & completion
             // (when hi is empty, it means it's unbounded)
-            if !node.hi.is_empty() && node.hi.as_ref() <= key.as_ref() {
+            if !view.hi().is_empty() && view.hi() <= key.as_ref() {
                 // we have encountered a child split, without
                 // having hit the parent split above.
-                cursor = node.next.expect(
+                cursor = view.next().expect(
                     "if our hi bound is not Inf (inity), \
                      we should have a right sibling",
                 );
@@ -1112,7 +1102,7 @@ impl Tree {
                 let (parent_id, _parent_frag, parent_ptr) = &path[idx];
 
                 let ps = Frag::ParentSplit(ParentSplit {
-                    at: node.lo.clone(),
+                    at: view.lo().into(),
                     to: cursor,
                 });
 
@@ -1132,20 +1122,12 @@ impl Tree {
                 }
             }
 
-            path.push((cursor, frag, cas_key.clone()));
-
-            match path
-                .last()
-                .expect("we just pushed to path, so it's not empty")
-                .1
-                .unwrap_base()
-                .data
-            {
+            match view.data() {
                 Data::Index(ref ptrs) => {
                     let old_cursor = cursor;
 
                     let search = binary_search_lub(ptrs, |&(ref k, ref _v)| {
-                        prefix_cmp_encoded(k, key.as_ref(), &node.lo)
+                        prefix_cmp_encoded(k, key.as_ref(), view.lo())
                     });
 
                     // This might be none if ord is Less and we're
@@ -1158,13 +1140,9 @@ impl Tree {
                         panic!("stuck in page traversal loop");
                     }
                 }
-                Data::Leaf(_) => {
-                    break;
-                }
+                Data::Leaf(data) => return Ok(data.clone()),
             }
         }
-
-        Ok(path)
     }
 
     // Remove all pages for this tree from the underlying
